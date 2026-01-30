@@ -21,6 +21,27 @@ function setCors(req, res) {
   }
 }
 
+import crypto from "crypto";
+
+function verifyToken(token, secret, maxAgeMs = 1000 * 60 * 60 * 24 * 30) { // 30 days
+  try {
+    const raw = Buffer.from(token, "base64url").toString("utf8");
+    const [email, ts, h] = raw.split("|");
+    if (!email || !ts || !h) return null;
+
+    const age = Date.now() - Number(ts);
+    if (!Number.isFinite(age) || age < 0 || age > maxAgeMs) return null;
+
+    const msg = `${email}|${ts}`;
+    const expected = crypto.createHmac("sha256", secret).update(msg).digest("hex");
+    if (expected !== h) return null;
+
+    return email;
+  } catch {
+    return null;
+  }
+}
+
 // Tiny multipart parser for 1 file + fields (no extra libraries)
 async function parseMultipart(req) {
   const ct = req.headers["content-type"] || "";
@@ -90,6 +111,14 @@ export default async function handler(req, res) {
 
     if (req.method === "OPTIONS") return res.status(200).end();
     if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
+
+    const secret = process.env.SESSION_SECRET;
+if (!secret) return res.status(500).json({ error: "Missing SESSION_SECRET" });
+
+const token = req.headers["x-fp-token"];
+const email = verifyToken(token, secret);
+if (!email) return res.status(401).json({ error: "Please enter your email to use the generator." });
+
 
     if (!rateLimit(req, res)) {
       return res.status(429).json({ error: "Rate limit exceeded. Please try again later." });
