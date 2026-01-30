@@ -1,0 +1,115 @@
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import OpenAI, { toFile } from "openai";
+
+const {
+  OPENAI_API_KEY,
+  PORT = 3000,
+  // Lock CORS to your domains (comma-separated). Add www + non-www.
+  ALLOWED_ORIGINS = "https://freshpainters.co.nz,https://www.freshpainters.co.nz",
+  RATE_LIMIT_WINDOW_MS = String(60 * 60 * 1000), // 1 hour
+  RATE_LIMIT_MAX = "8" // 8 generations per IP per window
+} = process.env;
+
+if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY env var");
+
+const app = express();
+
+// CORS (prevents other sites from calling your backend)
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      const allowed = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
+      if (!origin) return cb(null, true); // allows server-to-server / health checks
+      if (allowed.includes(origin)) return cb(null, true);
+      return cb(new Error("CORS blocked"));
+    }
+  })
+);
+
+// Multer in-memory upload
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 } // 20MB cap (you can increase later)
+});
+
+// Simple in-memory rate limit (good for MVP)
+const windowMs = Number(RATE_LIMIT_WINDOW_MS);
+const maxReq = Number(RATE_LIMIT_MAX);
+const ipBuckets = new Map();
+
+function rateLimit(req, res, next) {
+  const ip =
+    req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+    req.socket.remoteAddress ||
+    "unknown";
+
+  const now = Date.now();
+  const bucket = ipBuckets.get(ip) || { start: now, count: 0 };
+
+  if (now - bucket.start > windowMs) {
+    bucket.start = now;
+    bucket.count = 0;
+  }
+
+  bucket.count += 1;
+  ipBuckets.set(ip, bucket);
+
+  res.setHeader("X-RateLimit-Limit", String(maxReq));
+  res.setHeader("X-RateLimit-Remaining", String(Math.max(0, maxReq - bucket.count)));
+
+  if (bucket.count > maxReq) {
+    return res.status(429).json({ error: "Rate limit exceeded. Please try again later." });
+  }
+  next();
+}
+
+const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+app.get("/health", (_, res) => res.json({ ok: true }));
+
+app.post("/api/edit", rateLimit, upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Missing image file." });
+
+    const { prompt, n = "1", size = "auto", layout = "high" } = req.body || {};
+    if (!prompt || String(prompt).trim().length < 3) {
+      return res.status(400).json({ error: "Missing prompt." });
+    }
+
+    const mime = req.file.mimetype || "";
+    const okMime = ["image/jpeg", "image/png", "image/webp"].includes(mime);
+    if (!okMime) {
+      return res.status(400).json({ error: "Unsupported image type. Use JPG, PNG, or WEBP." });
+    }
+
+    const num = Math.min(3, Math.max(1, Number(n) || 1));
+
+    // Model choice:
+    // - gpt-image-1.5 = best overall quality
+    // - gpt-image-1 + input_fidelity=high = stronger preservation of the uploaded photo
+    // The edit endpoint supports GPT Image models. :contentReference[oaicite:1]{index=1}
+    const preserve = layout === "high";
+    const model = preserve ? "gpt-image-1" : "gpt-image-1.5";
+
+    const imageFile = await toFile(req.file.buffer, req.file.originalname || "upload", { type: mime });
+
+    const rsp = await client.images.edit({
+      model,
+      image: [imageFile],
+      prompt: String(prompt),
+      n: num,
+      size: String(size),
+      ...(model === "gpt-image-1" ? { input_fidelity: "high" } : {})
+    });
+
+    const images = (rsp.data || []).map(d => `data:image/png;base64,${d.b64_json}`);
+    return res.json({ images, model });
+  } catch (err) {
+    const msg = (err?.error?.message || err?.message || "Unknown error").toString();
+    return res.status(500).json({ error: msg });
+  }
+});
+
+app.listen(Number(PORT), () => console.log(`Server listening on :${PORT}`));
