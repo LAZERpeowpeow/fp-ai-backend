@@ -28,6 +28,14 @@ app.use(
   })
 );
 
+const app = express();
+
+app.use(cors({ /* ... */ }));
+
+app.get("/", (_, res) => res.json({ ok: true, service: "fp-ai-backend" }));
+
+app.get("/health", (_, res) => res.json({ ok: true }));
+
 // Multer in-memory upload
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -112,4 +120,6 @@ app.post("/api/edit", rateLimit, upload.single("image"), async (req, res) => {
   }
 });
 
-app.listen(Number(PORT), () => console.log(`Server listening on :${PORT}`));
+export default app;
+
+Fix Vercel handler
