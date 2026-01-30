@@ -5,28 +5,28 @@ export const config = {
   api: { bodyParser: false },
 };
 
-// Lock backend usage to your domains
+// ---- CORS: lock to your live domain(s) ----
 const ALLOWED_ORIGINS = new Set([
   "https://freshpainters.co.nz",
   "https://www.freshpainters.co.nz",
+  // If you ever test on a GoDaddy preview domain, add it here temporarily
+  // "https://YOUR-PREVIEW.godaddysites.com",
 ]);
 
 function setCors(req, res) {
   const origin = req.headers.origin;
-  if (!origin) return; // server-to-server allowed
+  if (!origin) return;
 
   if (ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-    // IMPORTANT: allow token header
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-FP-Token");
   }
 }
 
-// -------- Token verify (email unlock gate) --------
+// ---- Email-unlock token verify ----
 function verifyToken(token, secret, maxAgeMs = 1000 * 60 * 60 * 24 * 30) {
-  // token = base64url(email|timestamp|hmac)
   try {
     if (!token) return null;
     const raw = Buffer.from(token, "base64url").toString("utf8");
@@ -46,9 +46,9 @@ function verifyToken(token, secret, maxAgeMs = 1000 * 60 * 60 * 24 * 30) {
   }
 }
 
-// -------- Simple in-memory rate limit (MVP) --------
+// ---- Rate limit (basic, per-instance memory) ----
 const WINDOW_MS = 60 * 60 * 1000; // 1 hour
-const MAX_REQ_PER_WINDOW = 8; // per IP per hour
+const MAX_REQ_PER_WINDOW = 8;
 const buckets = new Map();
 
 function getClientIp(req) {
@@ -75,19 +75,17 @@ function rateLimit(req, res) {
   return b.count <= MAX_REQ_PER_WINDOW;
 }
 
-// -------- Tiny multipart parser (1 file + fields) --------
+// ---- Minimal multipart parser (1 image + text fields) ----
 async function parseMultipart(req) {
   const contentType = req.headers["content-type"] || "";
   const match = contentType.match(/boundary=(.+)$/);
   if (!match) throw new Error("Missing multipart boundary");
-
   const boundary = "--" + match[1];
 
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const buffer = Buffer.concat(chunks);
 
-  // Split by boundary
   const parts = buffer.toString("binary").split(boundary).slice(1, -1);
 
   const fields = {};
@@ -107,8 +105,7 @@ async function parseMultipart(req) {
     const nameMatch = disp.match(/name="([^"]+)"/);
     const filenameMatch = disp.match(/filename="([^"]*)"/);
 
-    // remove trailing \r\n
-    const bodyBinary = rawBody.slice(0, -2);
+    const bodyBinary = rawBody.slice(0, -2); // remove trailing \r\n
     const bodyBuf = Buffer.from(bodyBinary, "binary");
 
     const name = nameMatch ? nameMatch[1] : null;
@@ -125,78 +122,127 @@ async function parseMultipart(req) {
   return { fields, file };
 }
 
+// ---- Step 1: convert user prompt into an edit plan (Structured Outputs) ----
+async function buildEditPlan(openai, userPrompt) {
+  const schema = {
+    name: "design_edit_plan",
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        intent_summary: { type: "string" },
+        must_keep: { type: "array", items: { type: "string" } },
+        changes: { type: "array", items: { type: "string" } },
+        materials_palette: { type: "array", items: { type: "string" } },
+        lighting_notes: { type: "string" },
+        negative_constraints: { type: "array", items: { type: "string" } },
+        final_image_prompt: { type: "string" },
+      },
+      required: [
+        "intent_summary",
+        "must_keep",
+        "changes",
+        "materials_palette",
+        "lighting_notes",
+        "negative_constraints",
+        "final_image_prompt",
+      ],
+    },
+    strict: true,
+  };
+
+  const instructions = `
+You are an expert architectural visualiser and interior/exterior designer.
+Convert the user's request into a precise, photorealistic image-edit plan.
+
+Key requirements:
+- Do NOT describe a global filter / color grade. Changes must be localized and tangible (paint, materials, finishes, lighting).
+- Preserve the camera angle and geometry unless the user explicitly asks to change them.
+- Keep it realistic for a real renovation/paint job (no impossible structures).
+- No text, logos, watermarks, signage.
+
+Your output MUST match the JSON schema exactly.
+`.trim();
+
+  const model = process.env.TEXT_MODEL || "gpt-5"; // You can set TEXT_MODEL in Vercel if you want.
+
+  const resp = await openai.responses.create({
+    model,
+    reasoning: { effort: "low" },
+    instructions,
+    input: `User request:\n${userPrompt}`,
+    response_format: { type: "json_schema", json_schema: schema },
+  });
+
+  // SDK exposes parsed JSON via output_text in some cases; safest is parse JSON string:
+  const raw = resp.output_text?.trim();
+  if (!raw) throw new Error("Failed to generate edit plan.");
+  return JSON.parse(raw);
+}
+
+// ---- Step 2: run the image edit ----
+async function runImageEdit(openai, file, finalPrompt, n, size) {
+  const imageFile = await toFile(file.buffer, file.filename || "upload", { type: file.mime });
+
+  const rsp = await openai.images.edit({
+    model: "gpt-image-1",
+    image: [imageFile],
+    prompt: finalPrompt,
+    n,
+    size,
+    input_fidelity: "high",
+    quality: "high",
+  });
+
+  return (rsp.data || []).map((d) => `data:image/png;base64,${d.b64_json}`);
+}
+
 export default async function handler(req, res) {
   try {
     setCors(req, res);
 
-    // Preflight
     if (req.method === "OPTIONS") return res.status(200).end();
-
-    // Only POST
     if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
-    // Rate limit
     if (!rateLimit(req, res)) {
       return res.status(429).json({ error: "Rate limit exceeded. Please try again later." });
     }
 
-    // Require SESSION_SECRET (unlock gate)
     const secret = process.env.SESSION_SECRET;
     if (!secret) return res.status(500).json({ error: "Missing SESSION_SECRET" });
 
-    // Verify token from widget
     const token = req.headers["x-fp-token"];
     const email = verifyToken(token, secret);
-    if (!email) {
-      return res.status(401).json({ error: "Please enter your email to unlock the generator." });
-    }
+    if (!email) return res.status(401).json({ error: "Please enter your email to unlock the generator." });
 
-    // Require OpenAI key
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return res.status(500).json({ error: "Missing OPENAI_API_KEY on server" });
 
-    // Parse form-data
-    const { fields, file } = await parseMultipart(req);
+    const openai = new OpenAI({ apiKey });
 
+    const { fields, file } = await parseMultipart(req);
     if (!file?.buffer) return res.status(400).json({ error: "Missing image file" });
 
-    const prompt = (fields.prompt || "").trim();
-    if (prompt.length < 3) return res.status(400).json({ error: "Missing prompt" });
-
-    const n = Math.min(3, Math.max(1, Number(fields.n || 1)));
-    const size = fields.size || "auto";
-    const layout = fields.layout || "high";
-
     const okMime = ["image/jpeg", "image/png", "image/webp"].includes(file.mime);
-    if (!okMime) {
-      return res.status(400).json({ error: "Unsupported image type. Use JPG, PNG, or WEBP." });
-    }
+    if (!okMime) return res.status(400).json({ error: "Unsupported image type. Use JPG, PNG, or WEBP." });
 
-    // OpenAI
-    const client = new OpenAI({ apiKey });
+    const userPrompt = (fields.prompt || "").trim();
+    if (userPrompt.length < 3) return res.status(400).json({ error: "Please describe what you want to change." });
 
-    // Preserve layout strongly on "high"
-    const preserve = layout === "high";
-    const model = preserve ? "gpt-image-1" : "gpt-image-1.5";
+    const n = Math.min(3, Math.max(1, Number(fields.n || 2)));
+    const size = (fields.size || "auto").trim();
 
-    const imageFile = await toFile(file.buffer, file.filename || "upload", { type: file.mime });
+    // Step 1: create a “real edit plan” from whatever the user typed
+    const plan = await buildEditPlan(openai, userPrompt);
 
-    const rsp = await client.images.edit({
-      model,
-      image: [imageFile],
-      prompt,
-      n,
-      size,
-      ...(model === "gpt-image-1" ? { input_fidelity: "high" } : {}),
-    });
-
-    const images = (rsp.data || []).map((d) => `data:image/png;base64,${d.b64_json}`);
+    // Step 2: use the model-generated final prompt to edit the image
+    const images = await runImageEdit(openai, file, plan.final_image_prompt, n, size);
 
     return res.status(200).json({
       ok: true,
-      email, // optional: useful for debugging/admin
-      model,
       images,
+      plan_summary: plan.intent_summary, // helpful for UX/debug (optional)
+      // plan, // uncomment if you want to return full plan to the frontend
     });
   } catch (err) {
     return res.status(500).json({ error: err?.message || "Server error" });
