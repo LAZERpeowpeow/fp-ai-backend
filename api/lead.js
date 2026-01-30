@@ -1,11 +1,28 @@
 import crypto from "crypto";
 
+const ALLOWED_ORIGINS = new Set([
+  "https://freshpainters.co.nz",
+  "https://www.freshpainters.co.nz",
+  // If you're testing on a GoDaddy preview URL, add it here, e.g.:
+  // "https://YOUR-PREVIEW-NAME.godaddysites.com"
+]);
+
+function setCors(req, res) {
+  const origin = req.headers.origin;
+  if (!origin) return;
+  if (ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-FP-Token");
+  }
+}
+
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
 function sign(email, secret) {
-  // token = base64url(email|timestamp|hmac)
   const ts = Date.now().toString();
   const msg = `${email}|${ts}`;
   const h = crypto.createHmac("sha256", secret).update(msg).digest("hex");
@@ -28,6 +45,8 @@ async function postToWebhook(url, payload) {
 
 export default async function handler(req, res) {
   try {
+    setCors(req, res);
+
     if (req.method === "OPTIONS") return res.status(200).end();
     if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
