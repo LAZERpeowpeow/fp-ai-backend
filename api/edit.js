@@ -1,21 +1,19 @@
 import OpenAI, { toFile } from "openai";
 
 export const config = {
-  api: {
-    bodyParser: false, // we will parse multipart ourselves
-  },
+  api: { bodyParser: false }
 };
 
-function cors(res, origin) {
-  const allowed = [
-    "https://freshpainters.co.nz",
-    "https://www.freshpainters.co.nz",
-  ];
+// Lock to your domains (prevents other sites using your backend)
+const ALLOWED = new Set([
+  "https://freshpainters.co.nz",
+  "https://www.freshpainters.co.nz",
+]);
 
-  // If request has no Origin (server-to-server), allow
-  if (!origin) return;
-
-  if (allowed.includes(origin)) {
+function setCors(req, res) {
+  const origin = req.headers.origin;
+  if (!origin) return; // allow server-to-server
+  if (ALLOWED.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
@@ -23,20 +21,18 @@ function cors(res, origin) {
   }
 }
 
-// Very small multipart parser (enough for 1 file + fields).
-// This avoids installing extra libs.
+// Tiny multipart parser for 1 file + fields (no extra libraries)
 async function parseMultipart(req) {
-  const contentType = req.headers["content-type"] || "";
-  const match = contentType.match(/boundary=(.+)$/);
-  if (!match) throw new Error("Missing multipart boundary");
-  const boundary = "--" + match[1];
+  const ct = req.headers["content-type"] || "";
+  const m = ct.match(/boundary=(.+)$/);
+  if (!m) throw new Error("Missing multipart boundary");
+  const boundary = "--" + m[1];
 
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  for await (const c of req) chunks.push(c);
   const buffer = Buffer.concat(chunks);
 
   const parts = buffer.toString("binary").split(boundary).slice(1, -1);
-
   const fields = {};
   let file = null;
 
@@ -54,7 +50,7 @@ async function parseMultipart(req) {
     const nameMatch = disp.match(/name="([^"]+)"/);
     const filenameMatch = disp.match(/filename="([^"]*)"/);
 
-    const bodyBinary = rawBody.slice(0, -2); // remove trailing \r\n
+    const bodyBinary = rawBody.slice(0, -2); // drop trailing \r\n
     const bodyBuf = Buffer.from(bodyBinary, "binary");
 
     const name = nameMatch ? nameMatch[1] : null;
@@ -71,51 +67,54 @@ async function parseMultipart(req) {
   return { fields, file };
 }
 
+// Simple in-memory rate limit (per region instance) — good for MVP
+const WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const MAX = 8; // per IP per hour
+const buckets = new Map();
+
+function rateLimit(req, res) {
+  const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const b = buckets.get(ip) || { start: now, count: 0 };
+  if (now - b.start > WINDOW_MS) { b.start = now; b.count = 0; }
+  b.count += 1;
+  buckets.set(ip, b);
+  res.setHeader("X-RateLimit-Limit", String(MAX));
+  res.setHeader("X-RateLimit-Remaining", String(Math.max(0, MAX - b.count)));
+  return b.count <= MAX;
+}
+
 export default async function handler(req, res) {
   try {
-    cors(res, req.headers.origin);
+    setCors(req, res);
 
-    if (req.method === "OPTIONS") {
-      res.status(200).end();
-      return;
-    }
+    if (req.method === "OPTIONS") return res.status(200).end();
+    if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
-    if (req.method !== "POST") {
-      res.status(405).json({ error: "Use POST" });
-      return;
+    if (!rateLimit(req, res)) {
+      return res.status(429).json({ error: "Rate limit exceeded. Please try again later." });
     }
 
     const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      res.status(500).json({ error: "Missing OPENAI_API_KEY on server" });
-      return;
-    }
+    if (!apiKey) return res.status(500).json({ error: "Missing OPENAI_API_KEY on server" });
 
     const { fields, file } = await parseMultipart(req);
 
-    if (!file || !file.buffer) {
-      res.status(400).json({ error: "Missing image file" });
-      return;
-    }
+    if (!file?.buffer) return res.status(400).json({ error: "Missing image file" });
 
     const prompt = (fields.prompt || "").trim();
-    if (prompt.length < 3) {
-      res.status(400).json({ error: "Missing prompt" });
-      return;
-    }
+    if (prompt.length < 3) return res.status(400).json({ error: "Missing prompt" });
 
     const n = Math.min(3, Math.max(1, Number(fields.n || 1)));
     const size = fields.size || "auto";
     const layout = fields.layout || "high";
 
     const okMime = ["image/jpeg", "image/png", "image/webp"].includes(file.mime);
-    if (!okMime) {
-      res.status(400).json({ error: "Unsupported image type. Use JPG, PNG, or WEBP." });
-      return;
-    }
+    if (!okMime) return res.status(400).json({ error: "Unsupported image type. Use JPG, PNG, or WEBP." });
 
     const client = new OpenAI({ apiKey });
 
+    // Preserve photo strongly when layout=high
     const preserve = layout === "high";
     const model = preserve ? "gpt-image-1" : "gpt-image-1.5";
 
@@ -131,8 +130,8 @@ export default async function handler(req, res) {
     });
 
     const images = (rsp.data || []).map(d => `data:image/png;base64,${d.b64_json}`);
-    res.status(200).json({ images, model });
+    return res.status(200).json({ images, model });
   } catch (err) {
-    res.status(500).json({ error: err?.message || "Server error" });
+    return res.status(500).json({ error: err?.message || "Server error" });
   }
 }
