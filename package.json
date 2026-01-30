@@ -1,0 +1,9 @@
+{
+  "name": "fp-ai-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "openai": "^6.0.0"
+  }
+}
