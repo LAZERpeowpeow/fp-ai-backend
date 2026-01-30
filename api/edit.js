@@ -10,6 +10,25 @@ const ALLOWED = new Set([
   "https://www.freshpainters.co.nz",
 ]);
 
+function verifyToken(token, secret, maxAgeMs = 1000 * 60 * 60 * 24 * 30) { // 30 days
+  try {
+    const raw = Buffer.from(token, "base64url").toString("utf8");
+    const [email, ts, h] = raw.split("|");
+    if (!email || !ts || !h) return null;
+
+    const age = Date.now() - Number(ts);
+    if (!Number.isFinite(age) || age < 0 || age > maxAgeMs) return null;
+
+    const msg = `${email}|${ts}`;
+    const expected = crypto.createHmac("sha256", secret).update(msg).digest("hex");
+    if (expected !== h) return null;
+
+    return email;
+  } catch {
+    return null;
+  }
+}
+
 function setCors(req, res) {
   const origin = req.headers.origin;
   if (!origin) return; // allow server-to-server
@@ -17,7 +36,7 @@ function setCors(req, res) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-FP-Token");
   }
 }
 
