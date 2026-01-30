@@ -5,11 +5,11 @@ export const config = {
   api: { bodyParser: false },
 };
 
-// ---- CORS: lock to your live domain(s) ----
+// ---- CORS: allow only your site(s) ----
 const ALLOWED_ORIGINS = new Set([
   "https://freshpainters.co.nz",
   "https://www.freshpainters.co.nz",
-  // If you ever test on a GoDaddy preview domain, add it here temporarily
+  // If you test on a GoDaddy preview URL, add it temporarily, e.g.:
   // "https://YOUR-PREVIEW.godaddysites.com",
 ]);
 
@@ -25,7 +25,8 @@ function setCors(req, res) {
   }
 }
 
-// ---- Email-unlock token verify ----
+// ---- Unlock token verify (email gate) ----
+// token = base64url(email|timestamp|hmac_sha256(email|timestamp, secret))
 function verifyToken(token, secret, maxAgeMs = 1000 * 60 * 60 * 24 * 30) {
   try {
     if (!token) return null;
@@ -46,9 +47,9 @@ function verifyToken(token, secret, maxAgeMs = 1000 * 60 * 60 * 24 * 30) {
   }
 }
 
-// ---- Rate limit (basic, per-instance memory) ----
+// ---- Basic rate limit (per-instance memory) ----
 const WINDOW_MS = 60 * 60 * 1000; // 1 hour
-const MAX_REQ_PER_WINDOW = 8;
+const MAX_REQ_PER_WINDOW = 8;     // per IP per hour
 const buckets = new Map();
 
 function getClientIp(req) {
@@ -80,6 +81,7 @@ async function parseMultipart(req) {
   const contentType = req.headers["content-type"] || "";
   const match = contentType.match(/boundary=(.+)$/);
   if (!match) throw new Error("Missing multipart boundary");
+
   const boundary = "--" + match[1];
 
   const chunks = [];
@@ -122,65 +124,69 @@ async function parseMultipart(req) {
   return { fields, file };
 }
 
-// ---- Step 1: convert user prompt into an edit plan (Structured Outputs) ----
+// ---- Step 1: Turn ANY user prompt into a precise edit plan (Structured Outputs) ----
 async function buildEditPlan(openai, userPrompt) {
-  const schema = {
-    name: "design_edit_plan",
-    schema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        intent_summary: { type: "string" },
-        must_keep: { type: "array", items: { type: "string" } },
-        changes: { type: "array", items: { type: "string" } },
-        materials_palette: { type: "array", items: { type: "string" } },
-        lighting_notes: { type: "string" },
-        negative_constraints: { type: "array", items: { type: "string" } },
-        final_image_prompt: { type: "string" },
-      },
-      required: [
-        "intent_summary",
-        "must_keep",
-        "changes",
-        "materials_palette",
-        "lighting_notes",
-        "negative_constraints",
-        "final_image_prompt",
-      ],
+  // JSON Schema (inner schema object)
+  const innerSchema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      intent_summary: { type: "string" },
+      must_keep: { type: "array", items: { type: "string" } },
+      changes: { type: "array", items: { type: "string" } },
+      materials_palette: { type: "array", items: { type: "string" } },
+      lighting_notes: { type: "string" },
+      negative_constraints: { type: "array", items: { type: "string" } },
+      final_image_prompt: { type: "string" },
     },
-    strict: true,
+    required: [
+      "intent_summary",
+      "must_keep",
+      "changes",
+      "materials_palette",
+      "lighting_notes",
+      "negative_constraints",
+      "final_image_prompt",
+    ],
   };
 
   const instructions = `
 You are an expert architectural visualiser and interior/exterior designer.
 Convert the user's request into a precise, photorealistic image-edit plan.
 
-Key requirements:
-- Do NOT describe a global filter / color grade. Changes must be localized and tangible (paint, materials, finishes, lighting).
-- Preserve the camera angle and geometry unless the user explicitly asks to change them.
+Rules:
+- Do NOT apply a global filter/color grade. Changes must be localized and tangible (paint, materials, finishes, lighting).
+- Preserve camera angle, perspective, and geometry unless the user explicitly asks otherwise.
 - Keep it realistic for a real renovation/paint job (no impossible structures).
-- No text, logos, watermarks, signage.
-
-Your output MUST match the JSON schema exactly.
+- Avoid text, logos, watermarks, signage.
+- Produce a final_image_prompt that is ready to use in an image-edit model.
+Return ONLY JSON matching the schema.
 `.trim();
 
-  const model = process.env.TEXT_MODEL || "gpt-5"; // You can set TEXT_MODEL in Vercel if you want.
+  const model = process.env.TEXT_MODEL || "gpt-5";
 
+  // IMPORTANT: Responses API now uses text.format (not response_format)
   const resp = await openai.responses.create({
     model,
     reasoning: { effort: "low" },
     instructions,
     input: `User request:\n${userPrompt}`,
-    response_format: { type: "json_schema", json_schema: schema },
+    text: {
+      format: {
+        type: "json_schema",
+        name: "design_edit_plan",
+        strict: true,
+        schema: innerSchema,
+      },
+    },
   });
 
-  // SDK exposes parsed JSON via output_text in some cases; safest is parse JSON string:
   const raw = resp.output_text?.trim();
   if (!raw) throw new Error("Failed to generate edit plan.");
   return JSON.parse(raw);
 }
 
-// ---- Step 2: run the image edit ----
+// ---- Step 2: Run the image edit with high fidelity ----
 async function runImageEdit(openai, file, finalPrompt, n, size) {
   const imageFile = await toFile(file.buffer, file.filename || "upload", { type: file.mime });
 
@@ -213,7 +219,9 @@ export default async function handler(req, res) {
 
     const token = req.headers["x-fp-token"];
     const email = verifyToken(token, secret);
-    if (!email) return res.status(401).json({ error: "Please enter your email to unlock the generator." });
+    if (!email) {
+      return res.status(401).json({ error: "Please enter your email to unlock the generator." });
+    }
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return res.status(500).json({ error: "Missing OPENAI_API_KEY on server" });
@@ -227,22 +235,24 @@ export default async function handler(req, res) {
     if (!okMime) return res.status(400).json({ error: "Unsupported image type. Use JPG, PNG, or WEBP." });
 
     const userPrompt = (fields.prompt || "").trim();
-    if (userPrompt.length < 3) return res.status(400).json({ error: "Please describe what you want to change." });
+    if (userPrompt.length < 3) {
+      return res.status(400).json({ error: "Please describe what you want to change." });
+    }
 
     const n = Math.min(3, Math.max(1, Number(fields.n || 2)));
     const size = (fields.size || "auto").trim();
 
-    // Step 1: create a “real edit plan” from whatever the user typed
+    // Step 1: structured plan from any prompt
     const plan = await buildEditPlan(openai, userPrompt);
 
-    // Step 2: use the model-generated final prompt to edit the image
+    // Step 2: image edit prompt generated by the plan
     const images = await runImageEdit(openai, file, plan.final_image_prompt, n, size);
 
     return res.status(200).json({
       ok: true,
       images,
-      plan_summary: plan.intent_summary, // helpful for UX/debug (optional)
-      // plan, // uncomment if you want to return full plan to the frontend
+      plan_summary: plan.intent_summary,
+      // plan, // uncomment if you want to inspect the full plan in the browser
     });
   } catch (err) {
     return res.status(500).json({ error: err?.message || "Server error" });
